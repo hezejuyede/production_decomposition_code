@@ -1,0 +1,117 @@
+name: fetch-rice-public-data-r36-v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch_rice_public_data_r36_v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch and verify Dryad RLR workbook
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/data" "$GITHUB_WORKSPACE/logs"
+          python -m pip install --quiet selenium requests
+          cat > "$GITHUB_WORKSPACE/fetch_p2.py" <<'PY'
+          import hashlib, json, os, pathlib, time, zipfile, requests
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          out=root/'data'; logs=root/'logs'
+          expected='b716cb962614f7770074549aeb9d6e3269b18878e36e485a945ceeb0db00ba09'
+          report={'expected_sha256':expected,'attempts':[]}
+
+          def sha256(p):
+              h=hashlib.sha256()
+              with p.open('rb') as f:
+                  for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+              return h.hexdigest()
+          def valid(p):
+              try:
+                  if not p.exists() or p.stat().st_size<100000: return False
+                  with zipfile.ZipFile(p) as z:
+                      return '[Content_Types].xml' in z.namelist() and 'xl/workbook.xml' in z.namelist()
+              except Exception: return False
+          target=out/'P2_RLR_data.xlsx'
+
+          # Standard browser-like HTTP attempts first.
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'})
+          try: s.get('https://datadryad.org/dataset/doi:10.5061/dryad.kd51c5bhh',timeout=120)
+          except Exception as e: report['attempts'].append({'method':'landing','error':repr(e)})
+          for url in ['https://datadryad.org/downloads/file_stream/3839123','https://datadryad.org/stash/downloads/file_stream/3839123']:
+              try:
+                  r=s.get(url,timeout=180,allow_redirects=True)
+                  candidate=out/'candidate.xlsx'; candidate.write_bytes(r.content)
+                  digest=sha256(candidate) if candidate.exists() else None
+                  report['attempts'].append({'method':'requests','url':url,'status':r.status_code,'content_type':r.headers.get('content-type'),'bytes':len(r.content),'sha256':digest,'final_url':r.url})
+                  if valid(candidate) and digest==expected:
+                      candidate.replace(target); break
+                  candidate.unlink(missing_ok=True)
+              except Exception as e:
+                  report['attempts'].append({'method':'requests','url':url,'error':repr(e)})
+
+          # Use a real Chromium browser to satisfy Dryad's JS validation.
+          if not (valid(target) and sha256(target)==expected):
+              opts=Options(); opts.add_argument('--headless=new'); opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--window-size=1440,1200')
+              opts.add_experimental_option('prefs',{'download.default_directory':str(out.resolve()),'download.prompt_for_download':False,'download.directory_upgrade':True,'safebrowsing.enabled':True})
+              driver=None
+              try:
+                  driver=webdriver.Chrome(options=opts)
+                  driver.get('https://datadryad.org/dataset/doi:10.5061/dryad.kd51c5bhh')
+                  for i in range(90):
+                      if 'RLR_data.xlsx' in driver.page_source and 'Climate change is leading' in driver.page_source: break
+                      time.sleep(2)
+                  logs.joinpath('dryad_page.html').write_text(driver.page_source,encoding='utf-8',errors='ignore')
+                  before={p.name for p in out.iterdir()}
+                  link=WebDriverWait(driver,90).until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT,'RLR_data.xlsx')))
+                  href=link.get_attribute('href')
+                  report['attempts'].append({'method':'selenium_click','href':href,'before':sorted(before)})
+                  link.click()
+                  deadline=time.time()+240
+                  while time.time()<deadline:
+                      files=[p for p in out.iterdir() if p.is_file() and not p.name.endswith('.crdownload') and p.name not in before]
+                      for p in files:
+                          if valid(p):
+                              digest=sha256(p)
+                              report['attempts'].append({'method':'selenium_download','name':p.name,'bytes':p.stat().st_size,'sha256':digest})
+                              if digest==expected:
+                                  p.replace(target)
+                                  break
+                      if valid(target) and sha256(target)==expected: break
+                      time.sleep(2)
+              except Exception as e:
+                  report['attempts'].append({'method':'selenium','error':repr(e)})
+              finally:
+                  if driver: driver.quit()
+
+          ok=valid(target) and sha256(target)==expected
+          report['success']=ok
+          if target.exists(): report['file']={'name':target.name,'bytes':target.stat().st_size,'sha256':sha256(target)}
+          logs.joinpath('fetch_report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(report,indent=2,ensure_ascii=False))
+          if not ok: raise SystemExit('Dryad workbook not retrieved with the repository-published SHA-256')
+          PY
+          python "$GITHUB_WORKSPACE/fetch_p2.py" | tee "$GITHUB_WORKSPACE/logs/fetch_stdout.log"
+      - name: Upload verified Dryad workbook
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rice-public-data-r36-v2
+          path: |
+            data/
+            logs/
+          if-no-files-found: error
+          retention-days: 7
