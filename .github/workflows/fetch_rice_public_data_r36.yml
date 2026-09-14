@@ -1,0 +1,195 @@
+name: fetch-rice-public-data-r36
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch_rice_public_data_r36.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch public source workbooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/data" "$GITHUB_WORKSPACE/logs"
+          python -m pip install --quiet selenium requests
+          cat > "$GITHUB_WORKSPACE/fetch.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          import requests
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          out = root / 'data'
+          logs = root / 'logs'
+          out.mkdir(exist_ok=True)
+          logs.mkdir(exist_ok=True)
+          report = {'sources': {}}
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, 'rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def valid_xlsx(path):
+              try:
+                  if not path.exists() or path.stat().st_size < 1000:
+                      return False
+                  with zipfile.ZipFile(path) as z:
+                      return '[Content_Types].xml' in z.namelist() and 'xl/workbook.xml' in z.namelist()
+              except Exception:
+                  return False
+
+          # P1: public Figshare workbook.
+          p1 = out / 'P1_Rice_blast_variety_mixture_meta_analysis.xlsx'
+          urls = [
+              'https://ndownloader.figshare.com/files/53261867',
+              'https://api.figshare.com/v2/file/download/53261867',
+              'https://figshare.com/ndownloader/files/53261867',
+          ]
+          sess = requests.Session()
+          sess.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36'})
+          p1_errors=[]
+          for url in urls:
+              try:
+                  with sess.get(url, timeout=120, allow_redirects=True, stream=True) as r:
+                      r.raise_for_status()
+                      with open(p1, 'wb') as f:
+                          for chunk in r.iter_content(1024*1024):
+                              if chunk: f.write(chunk)
+                  if valid_xlsx(p1):
+                      report['sources']['P1']={'url':url,'final_url':r.url,'bytes':p1.stat().st_size,'sha256':sha256(p1),'valid_xlsx':True}
+                      break
+                  p1_errors.append(f'{url}: invalid xlsx bytes={p1.stat().st_size if p1.exists() else 0}')
+              except Exception as e:
+                  p1_errors.append(f'{url}: {type(e).__name__}: {e}')
+          else:
+              report['sources']['P1']={'valid_xlsx':False,'errors':p1_errors}
+
+          # P2: public Dryad workbook. First try HTTP session, then real Chrome to pass JS validation.
+          p2 = out / 'P2_RLR_data.xlsx'
+          dryad_urls = [
+              'https://datadryad.org/downloads/file_stream/3839123',
+              'https://datadryad.org/stash/downloads/file_stream/3839123',
+              'https://datadryad.org/api/v2/versions/343497/download',
+              'https://datadryad.org/api/v2/datasets/doi%3A10.5061%2Fdryad.kd51c5bhh/download',
+          ]
+          p2_errors=[]
+          sess2=requests.Session()
+          sess2.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36','Referer':'https://datadryad.org/dataset/doi:10.5061/dryad.kd51c5bhh'})
+          try:
+              sess2.get('https://datadryad.org/dataset/doi:10.5061/dryad.kd51c5bhh',timeout=120)
+          except Exception as e:
+              p2_errors.append(f'landing: {e}')
+          for url in dryad_urls:
+              try:
+                  with sess2.get(url, timeout=180, allow_redirects=True, stream=True) as r:
+                      if r.status_code >= 400:
+                          p2_errors.append(f'{url}: HTTP {r.status_code}')
+                          continue
+                      tmp = out/'p2_candidate.bin'
+                      with open(tmp,'wb') as f:
+                          for chunk in r.iter_content(1024*1024):
+                              if chunk: f.write(chunk)
+                      if valid_xlsx(tmp):
+                          tmp.replace(p2)
+                          report['sources']['P2']={'method':'requests','url':url,'final_url':r.url,'bytes':p2.stat().st_size,'sha256':sha256(p2),'valid_xlsx':True}
+                          break
+                      p2_errors.append(f'{url}: invalid payload {tmp.stat().st_size} bytes, type={r.headers.get("content-type")}')
+                      tmp.unlink(missing_ok=True)
+              except Exception as e:
+                  p2_errors.append(f'{url}: {type(e).__name__}: {e}')
+
+          if not valid_xlsx(p2):
+              options=Options()
+              options.add_argument('--headless=new')
+              options.add_argument('--no-sandbox')
+              options.add_argument('--disable-dev-shm-usage')
+              options.add_argument('--disable-gpu')
+              options.add_argument('--window-size=1440,1200')
+              options.add_experimental_option('prefs', {
+                  'download.default_directory': str(out.resolve()),
+                  'download.prompt_for_download': False,
+                  'download.directory_upgrade': True,
+                  'safebrowsing.enabled': True,
+              })
+              driver=None
+              try:
+                  driver=webdriver.Chrome(options=options)
+                  driver.get('https://datadryad.org/dataset/doi:10.5061/dryad.kd51c5bhh')
+                  # Allow JS proof-of-work / validation page to complete.
+                  for _ in range(60):
+                      if 'Climate change is leading' in driver.page_source and 'RLR_data.xlsx' in driver.page_source:
+                          break
+                      time.sleep(2)
+                  logs.joinpath('dryad_page.html').write_text(driver.page_source,encoding='utf-8',errors='ignore')
+                  link=WebDriverWait(driver,60).until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT,'RLR_data.xlsx')))
+                  link.click()
+                  deadline=time.time()+180
+                  while time.time()<deadline:
+                      candidates=[p for p in out.iterdir() if p.is_file() and p.suffix.lower()=='.xlsx']
+                      complete=[p for p in candidates if not p.name.endswith('.crdownload') and valid_xlsx(p)]
+                      if complete:
+                          src=max(complete,key=lambda p:p.stat().st_mtime)
+                          if src != p2:
+                              shutil.copy2(src,p2)
+                          break
+                      time.sleep(2)
+                  if valid_xlsx(p2):
+                      report['sources']['P2']={'method':'selenium','url':driver.current_url,'bytes':p2.stat().st_size,'sha256':sha256(p2),'valid_xlsx':True}
+                  else:
+                      p2_errors.append('selenium: no valid xlsx downloaded')
+              except Exception as e:
+                  p2_errors.append(f'selenium: {type(e).__name__}: {e}')
+              finally:
+                  if driver:
+                      driver.quit()
+          if not valid_xlsx(p2):
+              report['sources']['P2']={'valid_xlsx':False,'errors':p2_errors}
+          else:
+              expected='b716cb962614f7770074549aeb9d6e3269b18878e36e485a945ceeb0db00ba09'
+              report['sources']['P2']['expected_sha256']=expected
+              report['sources']['P2']['checksum_match']=report['sources']['P2']['sha256']==expected
+
+          # Remove accidental duplicate candidates after copying.
+          for p in out.glob('*.xlsx'):
+              if p.name not in {p1.name,p2.name}:
+                  p.unlink(missing_ok=True)
+          logs.joinpath('fetch_report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(report,indent=2,ensure_ascii=False))
+          if not valid_xlsx(p1):
+              raise SystemExit('P1 workbook download failed')
+          if not valid_xlsx(p2):
+              raise SystemExit('P2 workbook download failed')
+          PY
+          python "$GITHUB_WORKSPACE/fetch.py" | tee "$GITHUB_WORKSPACE/logs/fetch_stdout.log"
+          ls -lah "$GITHUB_WORKSPACE/data" "$GITHUB_WORKSPACE/logs"
+      - name: Upload verified public workbooks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rice-public-data-r36
+          path: |
+            data/
+            logs/
+          if-no-files-found: error
+          retention-days: 7
