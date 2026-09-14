@@ -1,0 +1,54 @@
+name: fetch-mendeley-rice-insects-r36-v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch_mendeley_rice_insects_r36_v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Download and verify public Mendeley ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data logs extracted
+          python - <<'PY'
+          import hashlib, json, pathlib, requests, zipfile, shutil
+          u='https://data.mendeley.com/public-api/zip/mfjtttk585/download/1'
+          r=requests.get(u,timeout=180,stream=True)
+          r.raise_for_status()
+          z=pathlib.Path('data/mfjtttk585_v1.zip')
+          with z.open('wb') as f:
+              for c in r.iter_content(1024*1024):
+                  if c:f.write(c)
+          with zipfile.ZipFile(z) as zz:
+              bad=zz.testzip()
+              if bad: raise RuntimeError('bad ZIP member '+bad)
+              zz.extractall('extracted')
+          files=[]
+          for p in sorted(pathlib.Path('extracted').rglob('*')):
+              if p.is_file():
+                  h=hashlib.sha256(p.read_bytes()).hexdigest()
+                  files.append({'path':str(p),'bytes':p.stat().st_size,'sha256':h})
+                  if p.suffix.lower()=='.xlsx': shutil.copy2(p,pathlib.Path('data')/p.name)
+          rep={'url':u,'final_url':r.url,'content_type':r.headers.get('content-type'),'zip_bytes':z.stat().st_size,'zip_sha256':hashlib.sha256(z.read_bytes()).hexdigest(),'files':files}
+          pathlib.Path('logs/fetch_report.json').write_text(json.dumps(rep,indent=2),encoding='utf-8')
+          print(json.dumps(rep,indent=2))
+          assert len([x for x in files if x['path'].lower().endswith('.xlsx')])>=2
+          PY
+      - name: Upload workbooks and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: mendeley-rice-insects-r36-v2
+          path: |
+            data/
+            logs/
+          if-no-files-found: error
+          retention-days: 7
