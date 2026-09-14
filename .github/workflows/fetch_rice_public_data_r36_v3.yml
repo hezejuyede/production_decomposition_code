@@ -1,0 +1,126 @@
+name: fetch-rice-public-data-r36-v3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch_rice_public_data_r36_v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch Dryad workbook through validated browser session
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/data" "$GITHUB_WORKSPACE/logs"
+          python -m pip install --quiet selenium requests
+          cat > "$GITHUB_WORKSPACE/fetch_p2.py" <<'PY'
+          import base64, hashlib, json, os, pathlib, time, zipfile, requests
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE']); out=root/'data'; logs=root/'logs'
+          expected='b716cb962614f7770074549aeb9d6e3269b18878e36e485a945ceeb0db00ba09'
+          report={'expected_sha256':expected,'attempts':[]}
+          target=out/'P2_RLR_data.xlsx'
+          def sha256(p):
+              h=hashlib.sha256()
+              with p.open('rb') as f:
+                  for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+              return h.hexdigest()
+          def valid(p):
+              try:
+                  if not p.exists() or p.stat().st_size<100000: return False
+                  with zipfile.ZipFile(p) as z: return '[Content_Types].xml' in z.namelist() and 'xl/workbook.xml' in z.namelist()
+              except Exception: return False
+
+          opts=Options(); opts.add_argument('--headless=new'); opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--window-size=1440,1200')
+          opts.add_experimental_option('prefs',{'download.default_directory':str(out.resolve()),'download.prompt_for_download':False,'download.directory_upgrade':True,'safebrowsing.enabled':True})
+          driver=None
+          try:
+              driver=webdriver.Chrome(options=opts)
+              driver.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior':'allow','downloadPath':str(out.resolve())})
+              landing='https://datadryad.org/dataset/doi:10.5061/dryad.kd51c5bhh'
+              driver.get(landing)
+              WebDriverWait(driver,180).until(lambda d: 'RLR_data.xlsx' in d.page_source and 'Climate change is leading' in d.page_source)
+              time.sleep(10)
+              ua=driver.execute_script('return navigator.userAgent')
+              cookies=driver.get_cookies()
+              logs.joinpath('cookies.json').write_text(json.dumps(cookies,indent=2),encoding='utf-8')
+              report['attempts'].append({'method':'landing','url':driver.current_url,'title':driver.title,'cookies':[c['name'] for c in cookies],'ua':ua})
+
+              # Method 1: reuse browser cookies in requests.
+              s=requests.Session(); s.headers.update({'User-Agent':ua,'Referer':landing,'Accept':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*'})
+              for c in cookies: s.cookies.set(c['name'],c['value'],domain=c.get('domain'),path=c.get('path','/'))
+              r=s.get('https://datadryad.org/downloads/file_stream/3839123',timeout=180,allow_redirects=True)
+              logs.joinpath('requests_payload.bin').write_bytes(r.content)
+              report['attempts'].append({'method':'requests_with_browser_cookies','status':r.status_code,'type':r.headers.get('content-type'),'bytes':len(r.content),'final_url':r.url,'sha256':hashlib.sha256(r.content).hexdigest()})
+              if len(r.content)>100000:
+                  target.write_bytes(r.content)
+
+              # Method 2: same-origin browser fetch with credentials.
+              if not (valid(target) and sha256(target)==expected):
+                  driver.set_script_timeout(240)
+                  js="""
+                  const done=arguments[arguments.length-1];
+                  fetch('/downloads/file_stream/3839123',{credentials:'include',redirect:'follow'})
+                    .then(async r=>{const b=new Uint8Array(await r.arrayBuffer()); let s=''; const n=0x8000; for(let i=0;i<b.length;i+=n){s+=String.fromCharCode.apply(null,b.subarray(i,Math.min(i+n,b.length)));} done({ok:r.ok,status:r.status,type:r.headers.get('content-type'),url:r.url,b64:btoa(s),bytes:b.length});})
+                    .catch(e=>done({error:String(e)}));
+                  """
+                  res=driver.execute_async_script(js)
+                  report['attempts'].append({k:v for k,v in res.items() if k!='b64'})
+                  if res.get('b64'):
+                      payload=base64.b64decode(res['b64'])
+                      logs.joinpath('browser_fetch_payload.bin').write_bytes(payload)
+                      if len(payload)>100000: target.write_bytes(payload)
+
+              # Method 3: click and monitor downloads/new tab.
+              if not (valid(target) and sha256(target)==expected):
+                  before={p.name for p in out.iterdir()}
+                  link=driver.find_element(By.PARTIAL_LINK_TEXT,'RLR_data.xlsx')
+                  href=link.get_attribute('href'); link.click()
+                  report['attempts'].append({'method':'click','href':href})
+                  deadline=time.time()+180
+                  while time.time()<deadline:
+                      for p in out.iterdir():
+                          if p.is_file() and p.name not in before and not p.name.endswith('.crdownload') and valid(p):
+                              d=sha256(p); report['attempts'].append({'method':'download_file','name':p.name,'bytes':p.stat().st_size,'sha256':d})
+                              if d==expected: p.replace(target); break
+                      if valid(target) and sha256(target)==expected: break
+                      # Switch to new tab and let WAF complete if needed.
+                      if len(driver.window_handles)>1:
+                          driver.switch_to.window(driver.window_handles[-1])
+                      time.sleep(2)
+                  logs.joinpath('final_page.html').write_text(driver.page_source,encoding='utf-8',errors='ignore')
+          except Exception as e:
+              report['attempts'].append({'method':'selenium_exception','error':type(e).__name__+': '+str(e)})
+          finally:
+              if driver: driver.quit()
+
+          ok=valid(target) and sha256(target)==expected
+          report['success']=ok
+          if target.exists(): report['file']={'name':target.name,'bytes':target.stat().st_size,'sha256':sha256(target),'valid_xlsx':valid(target)}
+          logs.joinpath('fetch_report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(report,indent=2,ensure_ascii=False))
+          if not ok: raise SystemExit('Dryad workbook not retrieved with published checksum')
+          PY
+          python "$GITHUB_WORKSPACE/fetch_p2.py" | tee "$GITHUB_WORKSPACE/logs/fetch_stdout.log"
+      - name: Upload browser evidence and verified workbook
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rice-public-data-r36-v3
+          path: |
+            data/
+            logs/
+          if-no-files-found: error
+          retention-days: 7
