@@ -1,0 +1,95 @@
+name: fetch-rice-public-data-r36-v4
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch_rice_public_data_r36_v4.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Resolve Dryad presigned URL and verify workbook
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/data" "$GITHUB_WORKSPACE/logs"
+          python -m pip install --quiet selenium requests
+          cat > "$GITHUB_WORKSPACE/fetch_p2.py" <<'PY'
+          import hashlib, json, os, pathlib, time, zipfile, requests
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.support.ui import WebDriverWait
+
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE']); out=root/'data'; logs=root/'logs'
+          target=out/'P2_RLR_data.xlsx'
+          expected='b716cb962614f7770074549aeb9d6e3269b18878e36e485a945ceeb0db00ba09'
+          report={'expected_sha256':expected,'attempts':[]}
+          def sha256(p):
+              h=hashlib.sha256()
+              with p.open('rb') as f:
+                  for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+              return h.hexdigest()
+          def valid(p):
+              try:
+                  if not p.exists() or p.stat().st_size<100000: return False
+                  with zipfile.ZipFile(p) as z: return '[Content_Types].xml' in z.namelist() and 'xl/workbook.xml' in z.namelist()
+              except Exception: return False
+
+          opts=Options(); opts.add_argument('--headless=new'); opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--window-size=1440,1200')
+          driver=None
+          try:
+              driver=webdriver.Chrome(options=opts)
+              driver.get('https://datadryad.org/dataset/doi:10.5061/dryad.kd51c5bhh')
+              WebDriverWait(driver,180).until(lambda d: 'RLR_data.xlsx' in d.page_source and 'AwsWafIntegration' in d.page_source)
+              time.sleep(8)
+              driver.set_script_timeout(180)
+              script="""
+              const done=arguments[arguments.length-1];
+              const go=()=>AwsWafIntegration.fetch('/downloads/zip_assembly_info/343497')
+                .then(async r=>({ok:r.ok,status:r.status,url:r.url,text:await r.text()}))
+                .then(done).catch(e=>done({error:String(e)}));
+              if (typeof AwsWafIntegration==='undefined') {done({error:'AwsWafIntegration undefined'});} else {go();}
+              """
+              res=driver.execute_async_script(script)
+              logs.joinpath('zip_assembly_response.json').write_text(json.dumps(res,indent=2),encoding='utf-8')
+              report['attempts'].append({k:v for k,v in res.items() if k!='text'})
+              if not res.get('ok'):
+                  raise RuntimeError('zip_assembly_info failed: '+json.dumps(res))
+              entries=json.loads(res['text'])
+              logs.joinpath('zip_assembly_entries.json').write_text(json.dumps(entries,indent=2),encoding='utf-8')
+              entry=next(x for x in entries if x.get('filename')=='RLR_data.xlsx')
+              url=entry['url']
+              report['resolved']={'filename':entry['filename'],'size':entry['size'],'url_host':url.split('/')[2]}
+              r=requests.get(url,timeout=180,stream=True)
+              r.raise_for_status()
+              with target.open('wb') as f:
+                  for chunk in r.iter_content(1024*1024):
+                      if chunk: f.write(chunk)
+              report['download']={'bytes':target.stat().st_size,'sha256':sha256(target),'content_type':r.headers.get('content-type'),'valid_xlsx':valid(target)}
+          except Exception as e:
+              report['error']=type(e).__name__+': '+str(e)
+          finally:
+              if driver: driver.quit()
+          ok=valid(target) and sha256(target)==expected
+          report['success']=ok
+          logs.joinpath('fetch_report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(report,indent=2,ensure_ascii=False))
+          if not ok: raise SystemExit('Dryad workbook checksum validation failed')
+          PY
+          python "$GITHUB_WORKSPACE/fetch_p2.py" | tee "$GITHUB_WORKSPACE/logs/fetch_stdout.log"
+      - name: Upload verified workbook and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rice-public-data-r36-v4
+          path: |
+            data/
+            logs/
+          if-no-files-found: error
+          retention-days: 7
