@@ -1,0 +1,122 @@
+name: fetch-mendeley-rice-insects-r36
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch_mendeley_rice_insects_r36.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch public Mendeley rice-insect workbooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/data" "$GITHUB_WORKSPACE/logs"
+          python -m pip install --quiet selenium requests
+          cat > "$GITHUB_WORKSPACE/fetch.py" <<'PY'
+          import hashlib, json, os, pathlib, re, time, zipfile, requests
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE']); out=root/'data'; logs=root/'logs'
+          report={'source':'https://data.mendeley.com/datasets/mfjtttk585/1','attempts':[]}
+          def sha256(p):
+              h=hashlib.sha256()
+              with p.open('rb') as f:
+                  for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+              return h.hexdigest()
+          def valid_xlsx(p):
+              try:
+                  with zipfile.ZipFile(p) as z: return '[Content_Types].xml' in z.namelist() and 'xl/workbook.xml' in z.namelist()
+              except Exception: return False
+          opts=Options(); opts.add_argument('--headless=new'); opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--window-size=1440,1600')
+          opts.add_experimental_option('prefs',{'download.default_directory':str(out.resolve()),'download.prompt_for_download':False,'download.directory_upgrade':True,'safebrowsing.enabled':True})
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          driver=None
+          try:
+              driver=webdriver.Chrome(options=opts)
+              driver.execute_cdp_cmd('Page.setDownloadBehavior',{'behavior':'allow','downloadPath':str(out.resolve())})
+              driver.get(report['source'])
+              WebDriverWait(driver,120).until(lambda d:'Raw data 1.xlsx' in d.page_source and 'Raw data 2.xlsx' in d.page_source)
+              time.sleep(5)
+              html=driver.page_source
+              logs.joinpath('page.html').write_text(html,encoding='utf-8',errors='ignore')
+              # collect direct anchors and script URLs
+              anchors=[]
+              for a in driver.find_elements(By.TAG_NAME,'a'):
+                  txt=(a.text or '').strip(); href=a.get_attribute('href')
+                  if href and ('download' in href.lower() or 'mendeley' in href.lower() or txt.endswith('.xlsx')):
+                      anchors.append({'text':txt,'href':href})
+              logs.joinpath('anchors.json').write_text(json.dumps(anchors,indent=2),encoding='utf-8')
+              report['attempts'].append({'anchors':anchors})
+
+              # click each named xlsx link if present
+              for fname in ['Raw data 1.xlsx','Raw data 2.xlsx']:
+                  try:
+                      el=driver.find_element(By.XPATH,f"//*[normalize-space(text())='{fname}']")
+                      el.click(); time.sleep(8)
+                      report['attempts'].append({'clicked':fname})
+                  except Exception as e:
+                      report['attempts'].append({'click_error':fname,'error':repr(e)})
+              # click Download All as fallback
+              try:
+                  el=driver.find_element(By.XPATH,"//*[contains(normalize-space(text()), 'Download All')]")
+                  el.click(); time.sleep(15)
+                  report['attempts'].append({'clicked':'Download All'})
+              except Exception as e:
+                  report['attempts'].append({'click_error':'Download All','error':repr(e)})
+
+              # performance log can expose API/download URLs
+              perflogs=driver.get_log('performance')
+              urls=[]
+              for x in perflogs:
+                  try:
+                      msg=json.loads(x['message'])['message']
+                      if msg['method']=='Network.responseReceived':
+                          u=msg['params']['response']['url']
+                          if any(k in u.lower() for k in ['download','dataset','file','api']): urls.append(u)
+                  except Exception: pass
+              logs.joinpath('network_urls.json').write_text(json.dumps(sorted(set(urls)),indent=2),encoding='utf-8')
+
+              deadline=time.time()+120
+              while time.time()<deadline:
+                  if not list(out.glob('*.crdownload')): break
+                  time.sleep(2)
+          finally:
+              if driver: driver.quit()
+
+          files=[]
+          # extract zip if Download All returned zip
+          for z in list(out.glob('*.zip')):
+              try:
+                  with zipfile.ZipFile(z) as zz: zz.extractall(out/'unzipped')
+              except Exception as e: report['attempts'].append({'zip_error':z.name,'error':repr(e)})
+          for p in sorted(out.rglob('*')):
+              if p.is_file() and p.suffix.lower()=='.xlsx' and valid_xlsx(p):
+                  files.append({'path':str(p.relative_to(out)),'bytes':p.stat().st_size,'sha256':sha256(p)})
+          report['files']=files; report['success']=len(files)>=2
+          logs.joinpath('fetch_report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(report,indent=2,ensure_ascii=False))
+          if len(files)<2: raise SystemExit('Did not retrieve both public workbooks')
+          PY
+          python "$GITHUB_WORKSPACE/fetch.py" | tee "$GITHUB_WORKSPACE/logs/fetch_stdout.log"
+      - name: Upload verified public files and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mendeley-rice-insects-r36
+          path: |
+            data/
+            logs/
+          if-no-files-found: error
+          retention-days: 7
